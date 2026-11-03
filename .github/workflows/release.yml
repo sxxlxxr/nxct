@@ -114,6 +114,109 @@ jobs:
         run: |
           tar -czf nxct-linux-x86_64.tar.gz -C dist nxct version.txt
           sha256sum nxct-linux-x86_64.tar.gz > SHA256SUMS
+      - name: Install the release in a clean home before publishing
+        run: |
+          python -B - <<'PY'
+          import fcntl
+          import json
+          import os
+          from pathlib import Path
+          import pty
+          import select
+          import struct
+          import subprocess
+          import tempfile
+          import termios
+          import time
+
+          workspace = Path(os.environ['GITHUB_WORKSPACE'])
+          tag = os.environ['GITHUB_REF_NAME']
+          with tempfile.TemporaryDirectory() as sandbox:
+              root = Path(sandbox)
+              home = root / 'home'
+              home.mkdir()
+              settings = home / '.config/nxct/settings.json'
+              settings.parent.mkdir(parents=True)
+              settings.write_text(json.dumps({
+                  'downloads_dir': '', 'games_dir': str(home), 'sources': [],
+                  'theme': 'nxct', 'startup_animation': False,
+              }))
+              original_settings = settings.read_bytes()
+
+              fake_bin = root / 'mock-bin'
+              fake_bin.mkdir()
+              fake_curl = fake_bin / 'curl'
+              fake_curl.write_text('''#!/usr/bin/env python3
+          import os
+          from pathlib import Path
+          import shutil
+          import sys
+
+          args = sys.argv[1:]
+          url = args[-1]
+          prefix = 'https://github.com/sxxlxxr/nxct/releases/'
+          assert url.startswith(prefix), url
+          route, filename = url[len(prefix):].rsplit('/', 1)
+          assert route in ('latest/download', 'download/' + os.environ['GITHUB_REF_NAME']), route
+          assert filename in ('nxct-linux-x86_64.tar.gz', 'SHA256SUMS'), filename
+          destination = Path(args[args.index('-o') + 1])
+          shutil.copyfile(Path(os.environ['GITHUB_WORKSPACE']) / filename, destination)
+          if os.getenv('NXCT_TEST_CORRUPT') and filename.endswith('.tar.gz'):
+              with destination.open('ab') as stream:
+                  stream.write(b'corrupt')
+          ''')
+              fake_curl.chmod(0o755)
+              env = dict(os.environ, HOME=str(home), XDG_DATA_HOME=str(root / 'data'),
+                         PATH=str(fake_bin) + os.pathsep + os.environ['PATH'], TERM='xterm-256color')
+
+              def install(*args, environment=env):
+                  return subprocess.run(['sh', str(workspace / 'install.sh'), *args],
+                                        env=environment, capture_output=True, text=True, timeout=120)
+
+              first = install()
+              assert first.returncode == 0, (first.stdout, first.stderr)
+              current = root / 'data/nxct/current'
+              launcher = home / '.local/bin/nxct'
+              assert current.is_symlink() and launcher.is_symlink()
+              assert (current / 'version.txt').read_text().strip() == tag[1:]
+              assert launcher.resolve() == (current / 'nxct/nxct').resolve()
+              assert subprocess.run([str(current / 'nxct/rqbit'), '--version'],
+                                    capture_output=True, timeout=10).returncode == 0
+              assert settings.read_bytes() == original_settings
+
+              master, slave = pty.openpty()
+              fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 100, 0, 0))
+              process = subprocess.Popen([str(launcher)], stdin=slave, stdout=slave, stderr=slave,
+                                         env=env, start_new_session=True)
+              os.close(slave)
+              output = bytearray()
+              deadline = time.monotonic() + 4
+              try:
+                  while time.monotonic() < deadline:
+                      ready, _, _ = select.select([master], [], [], 0.2)
+                      if ready:
+                          try:
+                              output.extend(os.read(master, 65536))
+                          except OSError:
+                              break
+                      if process.poll() is not None:
+                          break
+              finally:
+                  if process.poll() is None:
+                      process.terminate()
+                  process.wait(timeout=8)
+                  os.close(master)
+              assert b'NXCT' in output and b'Traceback' not in output, repr(output[-2000:])
+
+              again = install('--version', tag)
+              assert again.returncode == 0, (again.stdout, again.stderr)
+              assert settings.read_bytes() == original_settings
+              old_version = current.resolve()
+              corrupt = install('--version', tag, environment=dict(env, NXCT_TEST_CORRUPT='1'))
+              assert corrupt.returncode != 0 and 'контрольная сумма не совпадает' in corrupt.stderr
+              assert current.resolve() == old_version and settings.read_bytes() == original_settings
+              assert not list((root / 'data/nxct').glob('.install.*'))
+          PY
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
