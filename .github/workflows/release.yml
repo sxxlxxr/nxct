@@ -1,0 +1,82 @@
+name: Linux release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt 'textual==6.12.0' 'pyinstaller==6.22.3'
+      - name: Check source and user interface
+        run: |
+          python -B - <<'PY'
+          import asyncio
+          from pathlib import Path
+          from unittest.mock import patch
+          import app
+
+          async def check():
+              with patch.object(app, 'SETTINGS_PATH', Path('/tmp/nxct-ci-no-settings.json')):
+                  ui = app.CatalogueApp()
+              assert ui.settings.downloads_dir == ''
+              assert len(ui.settings.sources) == 5
+              assert all(s.name.lower() != 'steamrip' for s in ui.settings.sources)
+              ui.settings.startup_animation = False
+              async with ui.run_test(size=(80, 24)) as pilot:
+                  await pilot.pause()
+                  await pilot.click('#open-market')
+                  await pilot.pause()
+                  await pilot.click('#open-settings')
+                  await pilot.pause()
+
+          asyncio.run(check())
+          PY
+      - name: Build standalone NXCT
+        run: |
+          python -B - "$GITHUB_REF_NAME" <<'PY'
+          import sys
+          from app import APP_VERSION
+          assert sys.argv[1] == f'v{APP_VERSION}', 'tag must match app.py APP_VERSION'
+          PY
+          python -m PyInstaller --clean --noconfirm --onedir --name nxct app.py
+          printf '%s\n' "${GITHUB_REF_NAME#v}" > dist/version.txt
+          cp install.sh dist/nxct/install.sh
+          cp LICENSE dist/nxct/LICENSE-NXCT
+          chmod 755 dist/nxct/install.sh
+      - name: Include verified rqbit 9.1.0 and its license
+        run: |
+          curl -fLsS --retry 3 -o dist/nxct/rqbit \
+            https://github.com/ikatson/rqbit/releases/download/v9.1.0/rqbit-linux-amd64
+          printf '%s  %s\n' \
+            '921061a82ee6a6b26754c6367886b5b6b4ce5916d3edd5db79c6cd5f2c23499f' \
+            'dist/nxct/rqbit' | sha256sum -c -
+          chmod 755 dist/nxct/rqbit
+          dist/nxct/rqbit --version
+          curl -fLsS --retry 3 -o dist/nxct/LICENSE-rqbit \
+            https://raw.githubusercontent.com/ikatson/rqbit/v9.1.0/LICENSE
+          curl -fLsS --retry 3 -o dist/nxct/Apache-2.0.txt \
+            https://www.apache.org/licenses/LICENSE-2.0.txt
+      - name: Pack release with checksum
+        run: |
+          tar -czf nxct-linux-x86_64.tar.gz -C dist nxct version.txt
+          sha256sum nxct-linux-x86_64.tar.gz > SHA256SUMS
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            nxct-linux-x86_64.tar.gz SHA256SUMS \
+            --verify-tag --title "NXCT $GITHUB_REF_NAME" --generate-notes

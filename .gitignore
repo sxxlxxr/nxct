@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.env
+.env.*
+build/
+dist/
+/nxct.spec
+/rqbit
+/settings.json
+/library.json
+/downloads/
+/games/
+/nxct-linux-*.tar.gz
+/SHA256SUMS
