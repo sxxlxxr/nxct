@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v[0-9]*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -229,11 +230,16 @@ jobs:
           python -B - "$GITHUB_REF_NAME" <<'PY'
           import sys
           from app import APP_VERSION
-          assert sys.argv[1] == f'v{APP_VERSION}', 'tag must match app.py APP_VERSION'
+          assert (sys.argv[1] == f'v{APP_VERSION}' if sys.argv[1].startswith('v')
+                  else sys.argv[1] == 'main'), 'release tag must match APP_VERSION'
           PY
           python -m PyInstaller --clean --noconfirm --onedir --collect-all textual \
             --collect-all textual_image --name nxct app.py
-          printf '%s\n' "${GITHUB_REF_NAME#v}" > dist/version.txt
+          python -B - <<'PY'
+          from pathlib import Path
+          from app import APP_VERSION
+          Path('dist/version.txt').write_text(APP_VERSION + '\n')
+          PY
           cp install.sh dist/nxct/install.sh
           cp LICENSE dist/nxct/LICENSE-NXCT
           python -B - <<'PY'
@@ -342,6 +348,16 @@ jobs:
                       if b'\xd0\x94\xd0\xbe\xd1\x81\xd1\x82\xd1\x83\xd0\xbf\xd0\xbd\xd0\xb0' in output or \
                               'Установлена актуальная версия'.encode() in output:
                           break
+                  print('update-check diagnostics:', {
+                      name: text.encode() in output for name, text in (
+                          ('checking', 'Проверяю релизы NXCT'),
+                          ('available', 'Доступна версия'),
+                          ('current', 'Установлена актуальная версия'),
+                          ('error', 'Не удалось проверить обновления'),
+                          ('rate-limited', 'HTTP Error 403'),
+                          ('certificate', 'CERTIFICATE_VERIFY_FAILED'),
+                      )
+                  }, 'process-alive:', process.poll() is None, flush=True)
                   assert ('Доступна версия'.encode() in output or
                           'Установлена актуальная версия'.encode() in output), repr(output[-2000:])
                   assert b'CERTIFICATE_VERIFY_FAILED' not in output
@@ -352,6 +368,7 @@ jobs:
                   os.close(master)
           PY
       - name: Include verified rqbit 9.1.0 and its license
+        if: github.event_name == 'push'
         run: |
           curl -fLsS --retry 3 -o dist/nxct/rqbit \
             https://github.com/ikatson/rqbit/releases/download/v9.1.0/rqbit-linux-amd64
@@ -365,10 +382,12 @@ jobs:
           curl -fLsS --retry 3 -o dist/nxct/Apache-2.0.txt \
             https://www.apache.org/licenses/LICENSE-2.0.txt
       - name: Pack release with checksum
+        if: github.event_name == 'push'
         run: |
           tar -czf nxct-linux-x86_64.tar.gz -C dist nxct version.txt
           sha256sum nxct-linux-x86_64.tar.gz > SHA256SUMS
       - name: Install the release in a clean home before publishing
+        if: github.event_name == 'push'
         run: |
           python -B - <<'PY'
           import fcntl
@@ -472,6 +491,7 @@ jobs:
               assert not list((root / 'data/nxct').glob('.install.*'))
           PY
       - name: Publish GitHub release
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
