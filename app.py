@@ -4,6 +4,7 @@ import asyncio
 import base64
 from dataclasses import asdict, dataclass, field, replace
 import json
+from math import ceil, isfinite
 import os
 from pathlib import Path
 import re
@@ -44,7 +45,7 @@ from textual.widgets import (
 SETTINGS_PATH = Path.home() / ".config" / "nxct" / "settings.json"
 LIBRARY_PATH = SETTINGS_PATH.with_name("library.json")
 HYDRA_API = "https://hydra-api-us-east-1.losbroxas.org"
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.6"
 RELEASES_API = "https://api.github.com/repos/sxxlxxr/nxct/releases/latest"
 LINUX_ASSET = "nxct-linux-x86_64.tar.gz"
 RQBIT_OPENER = build_opener(ProxyHandler({}))
@@ -97,11 +98,37 @@ class TorrentDownload:
     state: str = "Ожидание"
     progress: float = 0.0
     speed: float = 0.0
+    downloaded_bytes: int = 0
+    total_bytes: int = 0
+    eta_seconds: int | None = None
+    connected_peers: int | None = None
+    connecting_peers: int | None = None
     started: bool = False
     process: subprocess.Popen | None = None
     port: int | None = None
     token: str | None = None
     torrent_id: int | None = None
+
+
+def format_data_size(value: int) -> str:
+    amount = float(max(0, value))
+    for unit in ("Б", "КиБ", "МиБ", "ГиБ", "ТиБ"):
+        if amount < 1024 or unit == "ТиБ":
+            return f"{int(amount)} Б" if unit == "Б" else f"{amount:.1f} {unit}"
+        amount /= 1024
+    raise AssertionError("недостижимый размер")
+
+
+def format_eta(seconds: int | None) -> str:
+    if seconds is None:
+        return "—"
+    if seconds < 60:
+        return f"{seconds} с"
+    if seconds < 3600:
+        return f"{seconds // 60} мин {seconds % 60} с"
+    if seconds < 86400:
+        return f"{seconds // 3600} ч {(seconds % 3600) // 60} мин"
+    return f"{seconds // 86400} д {(seconds % 86400) // 3600} ч"
 
 
 def local_port() -> int:
@@ -982,8 +1009,8 @@ class CatalogueApp(App):
                 with VerticalScroll(id="downloads-scroll"):
                     yield Label("МОИ ЗАГРУЗКИ", classes="eyebrow")
                     yield Static("Выберите игру → вариант → папку. После закрытия NXCT загрузки останавливаются.", classes="section-intro")
-                    yield DataTable(id="torrent-downloads", cursor_type="row", zebra_stripes=True)
                     yield Static("Выберите загрузку, чтобы увидеть вариант и папку.", id="download-detail", markup=False)
+                    yield DataTable(id="torrent-downloads", cursor_type="row", zebra_stripes=True)
                     with Horizontal(id="torrent-download-actions"):
                         yield Button("Пауза", id="pause-torrent", disabled=True)
                         yield Button("Продолжить", id="resume-torrent", disabled=True)
@@ -1590,16 +1617,43 @@ class CatalogueApp(App):
         self.query_one("#remove-torrent", Button).disabled = entry is None or entry.state in ("Подключение", "Останавливаю")
         self.query_one("#delete-torrent", Button).disabled = (entry is None or not entry.started
                                                               or entry.state in ("Подключение", "Останавливаю"))
-        self.query_one("#download-detail", Static).update(
-            f"{entry.variant.title}  ·  {entry.variant.size}\nПапка: {entry.destination}" if entry
-            else "Очередь пуста. Найдите игру, выберите вариант и папку для загрузки.")
+        if entry is None:
+            detail = "Очередь пуста. Найдите игру, выберите вариант и папку для загрузки."
+        else:
+            total = format_data_size(entry.total_bytes) if entry.total_bytes else "—"
+            speed = f"{entry.speed:.2f} МБ/с" if entry.state == "Загрузка" else "—"
+            eta = format_eta(entry.eta_seconds) if entry.state == "Загрузка" else "—"
+            if entry.state == "Загрузка":
+                if entry.connected_peers is None:
+                    connection = "Поиск пиров"
+                elif entry.connected_peers:
+                    connection = f"Пиров: {entry.connected_peers}"
+                    if entry.connecting_peers:
+                        connection += f", подключаются: {entry.connecting_peers}"
+                elif entry.connecting_peers:
+                    connection = f"Подключаются: {entry.connecting_peers}"
+                else:
+                    connection = "Нет подключённых пиров"
+            else:
+                connection = entry.state
+            detail = (f"{entry.variant.title}\n"
+                      f"Скачано: {format_data_size(entry.downloaded_bytes)} / {total}  ·  "
+                      f"Скорость: {speed}  ·  Осталось: {eta}\n"
+                      f"Соединение: {connection}\nПапка: {entry.destination}")
+        self.query_one("#download-detail", Static).update(detail)
 
     @on(DataTable.RowHighlighted, "#torrent-downloads")
-    def torrent_highlighted(self) -> None:
+    def torrent_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if self.torrent_closing or not event.data_table.is_attached:
+            return
         self.update_torrent_buttons()
 
     async def start_torrent(self, entry: TorrentDownload) -> None:
         entry.state = "Подключение"
+        entry.speed = 0.0
+        entry.eta_seconds = None
+        entry.connected_peers = None
+        entry.connecting_peers = None
         self.refresh_torrent_downloads()
         binary = bundled_rqbit()
         if binary is None:
@@ -1677,10 +1731,29 @@ class CatalogueApp(App):
                     continue
                 total = int(stats["total_bytes"])
                 done = int(stats["progress_bytes"])
+                if total < 0 or done < 0:
+                    raise ValueError("неверный объём загрузки")
+                entry.total_bytes = total
+                entry.downloaded_bytes = min(done, total) if total else done
                 entry.progress = max(0.0, min(100.0, 100 * done / total)) if total > 0 else 0.0
                 live = stats.get("live")
                 speed = live.get("download_speed") if isinstance(live, dict) else None
-                entry.speed = max(0.0, float(speed.get("mbps", 0))) if isinstance(speed, dict) else 0.0
+                rate = float(speed.get("mbps", 0)) if isinstance(speed, dict) else 0.0
+                entry.speed = max(0.0, rate) if isfinite(rate) else 0.0
+                snapshot = live.get("snapshot") if isinstance(live, dict) else None
+                peers = snapshot.get("peer_stats") if isinstance(snapshot, dict) else None
+                connected = peers.get("live") if isinstance(peers, dict) else None
+                connecting = peers.get("connecting") if isinstance(peers, dict) else None
+                entry.connected_peers = connected if type(connected) is int and connected >= 0 else None
+                entry.connecting_peers = connecting if type(connecting) is int and connecting >= 0 else None
+                remaining = live.get("time_remaining") if isinstance(live, dict) else None
+                duration = remaining.get("duration") if isinstance(remaining, dict) else None
+                seconds = duration.get("secs") if isinstance(duration, dict) else None
+                entry.eta_seconds = (seconds if entry.speed > 0 and type(seconds) is int
+                                     and 0 <= seconds < 10 ** 9 else None)
+                if entry.eta_seconds is None and entry.speed > 0 and total > done:
+                    estimate = (total - done) / (entry.speed * 1_000_000)
+                    entry.eta_seconds = ceil(estimate) if estimate < 10 ** 9 else None
                 if stats.get("state") == "error":
                     raise RuntimeError(str(stats.get("error") or "ошибка движка"))
                 if stats.get("finished") is True:
@@ -1688,6 +1761,8 @@ class CatalogueApp(App):
                     await self.stop_rqbit_process(entry)
                     entry.state = "Готово"
             except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+                entry.speed = 0.0
+                entry.eta_seconds = None
                 self.query_one("#torrent-download-status", Static).update(f"Ошибка проверки загрузки: {error}")
                 await self.stop_rqbit_process(entry)
                 entry.state = "Ошибка"
@@ -1710,6 +1785,9 @@ class CatalogueApp(App):
             entry.state = state
             if state == "Пауза":
                 entry.speed = 0.0
+                entry.eta_seconds = None
+                entry.connected_peers = None
+                entry.connecting_peers = None
         except (OSError, RuntimeError, ValueError, TimeoutError) as error:
             entry.state = "Ошибка"
             self.query_one("#torrent-download-status", Static).update(f"Команда rqbit не выполнена: {error}")

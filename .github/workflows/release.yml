@@ -29,8 +29,8 @@ jobs:
           import ssl
           import sys
           from threading import Event
-          from unittest.mock import patch
-          from textual.widgets import LoadingIndicator
+          from unittest.mock import Mock, patch
+          from textual.widgets import DataTable, LoadingIndicator, Static
           import app
 
           async def check():
@@ -89,6 +89,69 @@ jobs:
                   assert not ui.query_one('#update-loading', LoadingIndicator).display
 
           asyncio.run(check())
+
+          async def check_download_card(size):
+              with patch.object(app, 'SETTINGS_PATH', Path('/tmp/nxct-ci-no-settings.json')), \
+                   patch.object(app, 'LIBRARY_PATH', Path('/tmp/nxct-ci-no-library.json')):
+                  ui = app.CatalogueApp()
+              ui.settings.startup_animation = False
+              async with ui.run_test(size=size) as pilot:
+                  await pilot.pause()
+                  ui.action_tab('downloads-tab')
+                  await pilot.pause()
+                  process = Mock()
+                  process.poll.return_value = None
+                  variant = app.TorrentVariant('Тест', '—', 'magnet:?xt=urn:btih:' + 'a' * 40, 'a' * 40)
+                  entry = app.TorrentDownload(
+                      app.CatalogueGame('Тест', 'test', 'test', '—'), variant,
+                      Path('/tmp/NXCT-' + 'a' * 40), state='Загрузка', process=process, torrent_id=3)
+                  ui.torrent_downloads.append(entry)
+                  ui.refresh_torrent_downloads()
+                  table = ui.query_one('#torrent-downloads', DataTable)
+                  detail = ui.query_one('#download-detail', Static)
+                  stats = {
+                      'total_bytes': 5_000_000, 'progress_bytes': 1_000_000,
+                      'finished': False, 'live': {
+                          'download_speed': {'mbps': 1.0},
+                          'time_remaining': {'duration': {'secs': 120}},
+                          'snapshot': {'peer_stats': {'live': 3, 'connecting': 2}},
+                      },
+                  }
+                  with patch.object(app, 'rqbit_api', return_value=stats):
+                      await ui.update_torrent_stats()
+                  await pilot.pause()
+                  card = str(detail.content)
+                  assert 'Скачано: 976.6 КиБ / 4.8 МиБ' in card
+                  assert 'Скорость: 1.00 МБ/с' in card and 'Осталось: 2 мин 0 с' in card
+                  assert 'Пиров: 3, подключаются: 2' in card
+                  assert detail.region.height >= 4 and detail.region.y < table.region.y
+
+                  stats['live']['download_speed']['mbps'] = 0
+                  with patch.object(app, 'rqbit_api', return_value=stats):
+                      await ui.update_torrent_stats()
+                  assert entry.eta_seconds is None and 'Осталось: —' in str(detail.content)
+                  stats['live']['time_remaining'] = None
+                  stats['live']['download_speed']['mbps'] = 1.0
+                  with patch.object(app, 'rqbit_api', return_value=stats):
+                      await ui.update_torrent_stats()
+                  assert entry.eta_seconds == 4 and 'Осталось: 4 с' in str(detail.content)
+
+                  with patch.object(app, 'rqbit_api', return_value={}):
+                      await ui.control_torrent(entry, 'pause', 'Пауза')
+                  card = str(detail.content)
+                  assert entry.state == 'Пауза' and 'Скорость: —' in card
+                  assert 'Осталось: —' in card and 'Соединение: Пауза' in card
+                  if size == (80, 24):
+                      await table.remove()
+                      assert not table.is_attached
+                      ui.torrent_highlighted(DataTable.RowHighlighted(
+                          table, table.cursor_row, next(iter(table.rows))))
+                  await pilot.press('q')
+              assert ui.torrent_closing
+              assert ui.return_code in (0, None)
+
+          asyncio.run(check_download_card((120, 55)))
+          asyncio.run(check_download_card((80, 24)))
 
           with patch.object(sys, 'frozen', True, create=True), \
                patch.object(ssl, 'get_default_verify_paths', return_value=type('Paths', (), {'cafile': None})()), \
