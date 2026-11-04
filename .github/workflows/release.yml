@@ -28,15 +28,21 @@ jobs:
           from pathlib import Path
           import ssl
           import sys
+          from threading import Event
           from unittest.mock import patch
+          from textual.widgets import LoadingIndicator
           import app
 
           async def check():
               with patch.object(app, 'SETTINGS_PATH', Path('/tmp/nxct-ci-no-settings.json')):
                   ui = app.CatalogueApp()
               assert ui.settings.downloads_dir == ''
+              assert ui.settings.theme == 'nxct-mono'
               assert len(ui.settings.sources) == 5
               assert all(s.name.lower() != 'steamrip' for s in ui.settings.sources)
+              assert all(value[1:3] == value[3:5] == value[5:7]
+                         for value in app.THEME_PALETTES['nxct-mono'].values())
+              assert ui.available_themes['nxct-mono'].error == '#bdbdbd'
               ui.settings.startup_animation = False
               async with ui.run_test(size=(80, 24)) as pilot:
                   await pilot.pause()
@@ -44,6 +50,43 @@ jobs:
                   await pilot.pause()
                   await pilot.click('#open-settings')
                   await pilot.pause()
+
+                  ui.settings.startup_animation = True
+                  ui.action_tab('search-tab')
+                  await pilot.pause()
+                  search_gate = Event()
+
+                  def delayed_search(*_args):
+                      assert search_gate.wait(5)
+                      return [], 0, 1
+
+                  with patch.object(app, 'fetch_source_page', side_effect=delayed_search):
+                      search = asyncio.create_task(ui.load_remote_page(1, '', ui.settings.sources[:1], 'all'))
+                      try:
+                          await asyncio.sleep(0.05)
+                          assert ui.query_one('#search-loading', LoadingIndicator).display
+                      finally:
+                          search_gate.set()
+                      await search
+                  assert not ui.query_one('#search-loading', LoadingIndicator).display
+
+                  ui.action_tab('settings-tab')
+                  await pilot.pause()
+                  update_gate = Event()
+
+                  def delayed_update():
+                      assert update_gate.wait(5)
+                      return app.APP_VERSION
+
+                  with patch.object(app, 'latest_release_version', side_effect=delayed_update):
+                      update = asyncio.create_task(ui.check_updates())
+                      try:
+                          await asyncio.sleep(0.05)
+                          assert ui.query_one('#update-loading', LoadingIndicator).display
+                      finally:
+                          update_gate.set()
+                      await update
+                  assert not ui.query_one('#update-loading', LoadingIndicator).display
 
           asyncio.run(check())
 

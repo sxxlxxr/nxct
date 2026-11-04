@@ -32,6 +32,7 @@ from textual.widgets import (
     Footer,
     Input,
     Label,
+    LoadingIndicator,
     Select,
     Static,
     Switch,
@@ -43,7 +44,7 @@ from textual.widgets import (
 SETTINGS_PATH = Path.home() / ".config" / "nxct" / "settings.json"
 LIBRARY_PATH = SETTINGS_PATH.with_name("library.json")
 HYDRA_API = "https://hydra-api-us-east-1.losbroxas.org"
-APP_VERSION = "0.1.4"
+APP_VERSION = "0.1.5"
 RELEASES_API = "https://api.github.com/repos/sxxlxxr/nxct/releases/latest"
 LINUX_ASSET = "nxct-linux-x86_64.tar.gz"
 RQBIT_OPENER = build_opener(ProxyHandler({}))
@@ -436,6 +437,7 @@ def discover_games(root: Path) -> tuple[list[InstalledGame], bool]:
     return [entry for _, entry in candidates.values()], incomplete
 
 THEME_OPTIONS = (
+    ("Монохромная", "nxct-mono"),
     ("Тёмная бирюза", "nxct"),
     ("Светлая", "nxct-light"),
     ("Фиолетовая", "nxct-violet"),
@@ -444,6 +446,18 @@ THEME_OPTIONS = (
 
 # Дополнительные переменные используются также в модальных окнах и заставке.
 THEME_PALETTES = {
+    "nxct-mono": {
+        "bg": "#0e0e0e", "panel": "#1b1b1b", "table": "#141414",
+        "overlay": "#000000cc", "accent": "#e0e0e0", "text": "#ebebeb",
+        "secondary": "#bdbdbd", "muted": "#a3a3a3", "subtle": "#828282",
+        "hover": "#292929", "hover-border": "#777777",
+        "selected": "#454545", "selected-text": "#ffffff",
+        "input-border": "#606060", "header": "#303030",
+        "header-text": "#e0e0e0", "border": "#555555",
+        "title": "#ffffff", "note": "#c4c4c4",
+        "catalogue": "#202020", "strip": "#252525",
+        "strip-text": "#bdbdbd",
+    },
     "nxct": {
         "bg": "#0c1118", "panel": "#111b27", "table": "#0f1722",
         "overlay": "#060b12cc", "accent": "#65e0c3", "text": "#d9e2ef",
@@ -500,7 +514,7 @@ class Settings:
     downloads_dir: str = ""
     games_dir: str = str(Path.home())
     startup_animation: bool = True
-    theme: str = "nxct"
+    theme: str = "nxct-mono"
     sources: list[DownloadSource] = field(default_factory=lambda: list(DEFAULT_SOURCES))
 
 
@@ -834,6 +848,9 @@ class CatalogueApp(App):
     #remote-page { width: 1fr; min-width: 1; height: auto; color: $nxct-secondary; }
     #remote-pages Button { margin-right: 1; }
     #result-status { height: auto; min-height: 1; color: $nxct-secondary; }
+    #result-status-row { height: auto; min-height: 1; }
+    #result-status, #update-status { width: 1fr; }
+    #search-loading, #update-loading { display: none; width: 3; height: 1; color: $nxct-accent; }
     #results-layout { height: 1fr; }
     #games { width: 3fr; height: 1fr; background: $nxct-table; border: round $nxct-border; }
     DataTable > .datatable--header { background: $nxct-header; color: $nxct-header-text; text-style: bold; }
@@ -872,6 +889,7 @@ class CatalogueApp(App):
     .path-info { height: auto; color: $nxct-muted; margin-bottom: 1; }
     #settings-status { height: auto; min-height: 2; margin-top: 1; color: $nxct-accent; }
     #update-status { height: auto; min-height: 2; margin-top: 1; color: $nxct-secondary; }
+    #update-status-row { height: auto; min-height: 2; }
     #install-update { margin-top: 1; }
     #status-strip { height: 1; padding: 0 2; background: $nxct-strip; color: $nxct-strip-text; }
     Footer { background: $nxct-panel; }
@@ -893,6 +911,7 @@ class CatalogueApp(App):
         self.remote_query = ""
         self.remote_filter = "all"
         self.remote_source_ids: tuple[str, ...] = ()
+        self.search_loading_request = 0
         self.torrent_downloads: list[TorrentDownload] = []
         self.torrent_closing = False
         self.available_update: str | None = None
@@ -901,6 +920,7 @@ class CatalogueApp(App):
             self.register_theme(Theme(
                 name=name, primary=palette["accent"], secondary=palette["hover-border"],
                 success=palette["accent"], warning=palette["note"],
+                error=palette["secondary"] if name == "nxct-mono" else None,
                 foreground=palette["text"], background=palette["bg"],
                 surface=palette["panel"], panel=palette["table"],
                 dark=name != "nxct-light",
@@ -942,7 +962,9 @@ class CatalogueApp(App):
                                  value="all", allow_blank=False, id="source-filter")
                     yield Input(placeholder="Название игры…  /", id="search-input")
                     yield Button("Найти →", id="search-submit", variant="success")
-                yield Static("Нажмите «Найти», чтобы открыть игры подключённых источников.", id="result-status", markup=False)
+                with Horizontal(id="result-status-row"):
+                    yield Static("Нажмите «Найти», чтобы открыть игры подключённых источников.", id="result-status", markup=False)
+                    yield LoadingIndicator(id="search-loading")
                 with Horizontal(id="results-layout"):
                     yield DataTable(id="games", cursor_type="row", zebra_stripes=True)
                     with VerticalScroll(id="details"):
@@ -1004,7 +1026,7 @@ class CatalogueApp(App):
                         yield Label("Цветовая тема", classes="setting-label")
                         yield Select(THEME_OPTIONS, value=self.settings.theme, allow_blank=False, id="theme-select")
                     with Horizontal(classes="setting-row"):
-                        yield Label("Эффект появления NXCT при запуске", classes="setting-label")
+                        yield Label("Анимации интерфейса", classes="setting-label")
                         yield Switch(value=self.settings.startup_animation, id="startup-animation")
                     yield Button("Сохранить настройки", id="save-settings", variant="success")
                     yield Static(id="settings-status", markup=False)
@@ -1012,7 +1034,9 @@ class CatalogueApp(App):
                     yield Static(f"Установлена версия NXCT {APP_VERSION}. Проверка — только по нажатию.",
                                  classes="section-intro")
                     yield Button("Проверить обновления", id="check-updates")
-                    yield Static("", id="update-status", markup=False)
+                    with Horizontal(id="update-status-row"):
+                        yield Static("", id="update-status", markup=False)
+                        yield LoadingIndicator(id="update-loading")
                     yield Button("Установить обновление", id="install-update", variant="success", disabled=True)
                     yield Label("КОНФИДЕНЦИАЛЬНОСТЬ", classes="eyebrow")
                     yield Static("Подключённые источники загружаются по нажатию с hydra-api-us-east-1.losbroxas.org; сервер видит ваш IP и запрос. Торрент раскрывает ваш IP участникам сети.\nДобавленные URL хранятся в настройках. Очередь не сохраняется; после выхода файлы остаются на диске.", classes="section-intro")
@@ -1090,7 +1114,7 @@ class CatalogueApp(App):
             status.update(f"Не удалось сохранить настройки: {error}")
             return
         self.settings = settings
-        status.update("Настройки сохранены. Параметр анимации применяется при следующем запуске.")
+        status.update("Настройки сохранены. Анимации применяются при следующем действии или запуске.")
 
     def on_resize(self, event: events.Resize) -> None:
         self.screen.set_class(event.size.width < 95, "narrow")
@@ -1286,9 +1310,11 @@ class CatalogueApp(App):
         button = self.query_one("#check-updates", Button)
         status = self.query_one("#update-status", Static)
         install = self.query_one("#install-update", Button)
+        loading = self.query_one("#update-loading", LoadingIndicator)
         button.disabled = True
         install.disabled = True
         self.available_update = None
+        loading.display = self.settings.startup_animation
         status.update("Проверяю релизы NXCT на GitHub…")
         try:
             version = await asyncio.to_thread(latest_release_version)
@@ -1306,6 +1332,7 @@ class CatalogueApp(App):
         except (HTTPError, URLError, OSError, ValueError, TimeoutError) as error:
             status.update(f"Не удалось проверить обновления: {error}")
         finally:
+            loading.display = False
             button.disabled = False
 
     @on(Button.Pressed, "#install-update")
@@ -1459,6 +1486,10 @@ class CatalogueApp(App):
     async def load_remote_page(self, page: int, query: str,
                                sources: list[DownloadSource], selected: str) -> None:
         status = self.query_one("#result-status", Static)
+        loading = self.query_one("#search-loading", LoadingIndicator)
+        self.search_loading_request += 1
+        request = self.search_loading_request
+        loading.display = self.settings.startup_animation
         status.update("Ищу игры в подключённых источниках…")
         try:
             games, total, pages = await asyncio.to_thread(fetch_source_page, page, query, sources)
@@ -1466,6 +1497,9 @@ class CatalogueApp(App):
             if selected == self.query_one("#source-filter", Select).value:
                 status.update(f"Поиск недоступен: {error}")
             return
+        finally:
+            if request == self.search_loading_request:
+                loading.display = False
         if selected != self.query_one("#source-filter", Select).value:
             return
         table = self.query_one("#games", DataTable)
@@ -1766,6 +1800,10 @@ class CatalogueApp(App):
     @on(TabbedContent.TabActivated, "#tabs")
     def section_activated(self) -> None:
         pane = self.query_one("#tabs", TabbedContent).active
+        if self.settings.startup_animation:
+            content = self.query_one(f"#{pane}", TabPane)
+            content.styles.opacity = 0.35
+            content.styles.animate("opacity", 1.0, duration=0.18, easing="out_cubic")
         is_library = pane == "library-tab"
         self.query_one("#market-nav").display = not is_library
         for button in self.query(".nav-button"):
