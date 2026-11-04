@@ -43,7 +43,7 @@ from textual.widgets import (
 SETTINGS_PATH = Path.home() / ".config" / "nxct" / "settings.json"
 LIBRARY_PATH = SETTINGS_PATH.with_name("library.json")
 HYDRA_API = "https://hydra-api-us-east-1.losbroxas.org"
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.4"
 RELEASES_API = "https://api.github.com/repos/sxxlxxr/nxct/releases/latest"
 LINUX_ASSET = "nxct-linux-x86_64.tar.gz"
 RQBIT_OPENER = build_opener(ProxyHandler({}))
