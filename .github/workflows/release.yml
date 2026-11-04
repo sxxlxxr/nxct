@@ -321,7 +321,11 @@ jobs:
                           break
 
               try:
-                  collect(1.5)
+                  for _ in range(60):
+                      collect(0.2)
+                      if 'МОЯ БИБЛИОТЕКА'.encode() in output:
+                          break
+                  assert 'МОЯ БИБЛИОТЕКА'.encode() in output, repr(output[-2000:])
                   os.write(master, b'4')
                   for _ in range(40):
                       collect(0.2)
