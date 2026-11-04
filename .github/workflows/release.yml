@@ -30,7 +30,9 @@ jobs:
           import sys
           from threading import Event
           from unittest.mock import Mock, patch
+          from PIL import Image as PILImage
           from textual.widgets import DataTable, LoadingIndicator, Static
+          from textual_image.widget import Image as TerminalImage
           import app
 
           async def check():
@@ -153,6 +155,64 @@ jobs:
           asyncio.run(check_download_card((120, 55)))
           asyncio.run(check_download_card((80, 24)))
 
+          cover_url = 'https://shared.steamstatic.com/steam/apps/620/header.jpg'
+          with patch.object(app, 'hydra_json', return_value={
+              'count': 1,
+              'edges': [{'title': 'Portal 2', 'shop': 'steam', 'objectId': '620',
+                         'genres': ['Puzzle'], 'libraryImageUrl': cover_url}],
+          }):
+              games, _, _ = app.fetch_source_page(1, 'Portal', list(app.DEFAULT_SOURCES[:1]))
+          assert len(games) == 1 and games[0].image_url == cover_url
+          for unsafe in ('http://shared.steamstatic.com/cover.jpg',
+                         'https://shared.steamstatic.com.evil.example/cover.jpg',
+                         'https://127.0.0.1/cover.jpg',
+                         'https://shared.steamstatic.com:444/cover.jpg'):
+              with patch.object(app, 'build_opener', side_effect=AssertionError('unsafe request')):
+                  try:
+                      app.fetch_game_cover(unsafe)
+                  except ValueError:
+                      pass
+                  else:
+                      raise AssertionError(f'unsafe cover URL accepted: {unsafe}')
+          assert app.NoImageRedirect().redirect_request(None, None, 302, '', {},
+                                                        'http://127.0.0.1/') is None
+
+          async def check_game_cover(size):
+              with patch.object(app, 'SETTINGS_PATH', Path('/tmp/nxct-ci-no-settings.json')), \
+                   patch.object(app, 'LIBRARY_PATH', Path('/tmp/nxct-ci-no-library.json')):
+                  ui = app.CatalogueApp()
+              ui.settings.startup_animation = False
+              async with ui.run_test(size=size) as pilot:
+                  await pilot.pause()
+                  ui.action_tab('search-tab')
+                  await pilot.pause()
+                  with patch.object(app, 'fetch_game_cover',
+                                    return_value=PILImage.new('RGB', (460, 215), '#123456')) as fetch:
+                      ui.show_remote_game(games[0])
+                      cover = ui.query_one('#game-cover', TerminalImage)
+                      for _ in range(40):
+                          await pilot.pause()
+                          if cover.display:
+                              break
+                          await asyncio.sleep(0.01)
+                      assert cover.display and cover.image is not None
+                      await pilot.press('i')
+                      await pilot.pause()
+                      assert isinstance(ui.screen, app.GameCoverPreview)
+                      preview = ui.screen.query_one('#cover-preview-image', TerminalImage)
+                      assert preview.image is cover.image and preview.region.height >= 5
+                      await pilot.press('escape')
+                      await pilot.pause()
+                      assert not isinstance(ui.screen, app.GameCoverPreview)
+                      assert fetch.call_count == 1, 'preview should not fetch again'
+                      ui.clear_search()
+                      await pilot.pause()
+                      assert not cover.display and cover.image is None
+                  await pilot.press('q')
+
+          asyncio.run(check_game_cover((120, 55)))
+          asyncio.run(check_game_cover((80, 24)))
+
           with patch.object(sys, 'frozen', True, create=True), \
                patch.object(ssl, 'get_default_verify_paths', return_value=type('Paths', (), {'cafile': None})()), \
                patch.dict(os.environ, {'LD_LIBRARY_PATH': '/nxct/_internal'}):
@@ -171,10 +231,28 @@ jobs:
           from app import APP_VERSION
           assert sys.argv[1] == f'v{APP_VERSION}', 'tag must match app.py APP_VERSION'
           PY
-          python -m PyInstaller --clean --noconfirm --onedir --collect-all textual --name nxct app.py
+          python -m PyInstaller --clean --noconfirm --onedir --collect-all textual \
+            --collect-all textual_image --name nxct app.py
           printf '%s\n' "${GITHUB_REF_NAME#v}" > dist/version.txt
           cp install.sh dist/nxct/install.sh
           cp LICENSE dist/nxct/LICENSE-NXCT
+          python -B - <<'PY'
+          from importlib.metadata import distribution
+          from pathlib import Path
+          from shutil import copyfile
+
+          for package, filename, target in (
+              ('textual-image', 'LICENSE.txt', 'LICENSE-textual-image'),
+              ('pillow', 'LICENSE', 'LICENSE-Pillow'),
+          ):
+              installed = distribution(package)
+              license_file = next((item for item in installed.files or []
+                                   if str(item).endswith(f'licenses/{filename}')), None)
+              assert license_file is not None, f'{package} license missing'
+              source = installed.locate_file(license_file)
+              assert source.is_file(), f'{package} license missing'
+              copyfile(source, Path('dist/nxct') / target)
+          PY
           chmod 755 dist/nxct/install.sh
       - name: Start packaged NXCT in a clean terminal
         run: |

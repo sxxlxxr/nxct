@@ -3,7 +3,9 @@
 import asyncio
 import base64
 from dataclasses import asdict, dataclass, field, replace
+from io import BytesIO
 import json
+import logging
 from math import ceil, isfinite
 import os
 from pathlib import Path
@@ -18,7 +20,12 @@ from time import monotonic, sleep
 from typing import Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlsplit
-from urllib.request import ProxyHandler, Request, build_opener, urlopen
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener, urlopen
+
+# Терминал без ответа на запрос графики не должен печатать traceback до запуска NXCT.
+logging.getLogger("textual_image._terminal").setLevel(logging.ERROR)
+
+from PIL import Image as PILImage
 
 from textual import events, on
 from textual.app import App, ComposeResult
@@ -40,12 +47,13 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
 )
+from textual_image.widget import Image as TerminalImage
 
 
 SETTINGS_PATH = Path.home() / ".config" / "nxct" / "settings.json"
 LIBRARY_PATH = SETTINGS_PATH.with_name("library.json")
 HYDRA_API = "https://hydra-api-us-east-1.losbroxas.org"
-APP_VERSION = "0.1.6"
+APP_VERSION = "0.1.7"
 RELEASES_API = "https://api.github.com/repos/sxxlxxr/nxct/releases/latest"
 LINUX_ASSET = "nxct-linux-x86_64.tar.gz"
 RQBIT_OPENER = build_opener(ProxyHandler({}))
@@ -58,6 +66,7 @@ class CatalogueGame:
     object_id: str
     genre: str
     source: str = "—"
+    image_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -180,6 +189,39 @@ def hydra_json(path: str, body: dict | None = None) -> object:
     return json.loads(payload)
 
 
+class NoImageRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, url):
+        return None
+
+
+def fetch_game_cover(url: str) -> PILImage.Image:
+    """Загружает только ограниченные по размеру изображения с известных HTTPS-CDN."""
+    if not isinstance(url, str) or len(url) > 2048 or any(char in url for char in "\r\n\t"):
+        raise ValueError("неверная ссылка на обложку")
+    parsed = urlsplit(url)
+    host = parsed.hostname or ""
+    trusted_hosts = ("steamstatic.com", "akamaihd.net", "losbroxas.org",
+                     "steamgriddb.com", "launchbox-app.com")
+    if (parsed.scheme != "https" or not parsed.path.startswith("/") or parsed.username
+            or parsed.password or parsed.fragment or parsed.port not in (None, 443)
+            or not any(host == allowed or host.endswith("." + allowed) for allowed in trusted_hosts)):
+        raise ValueError("неразрешённый адрес обложки")
+    opener = build_opener(HTTPSHandler(context=https_context()), NoImageRedirect())
+    request = Request(url, headers={"Accept": "image/jpeg, image/png, image/webp",
+                                    "User-Agent": f"NXCT/{APP_VERSION}"})
+    with opener.open(request, timeout=8) as response:
+        if response.headers.get_content_type() not in ("image/jpeg", "image/png", "image/webp"):
+            raise ValueError("неверный формат обложки")
+        payload = response.read(4_000_001)
+    if len(payload) > 4_000_000:
+        raise ValueError("слишком большая обложка")
+    with PILImage.open(BytesIO(payload)) as image:
+        if image.width * image.height > 8_000_000:
+            raise ValueError("слишком большое разрешение обложки")
+        image.thumbnail((800, 800))
+        return image.convert("RGB")
+
+
 def bundled_rqbit() -> str | None:
     """Используем комплектный движок, не полагаясь на PATH пользователя."""
     base = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
@@ -285,7 +327,9 @@ def fetch_source_page(page: int, query: str, sources: list[DownloadSource]) -> t
         genre = ", ".join(value[:30] for value in genres[:2] if isinstance(value, str)) if isinstance(genres, list) else ""
         names = item.get("downloadSources")
         source = ", ".join(value[:40] for value in names[:3] if isinstance(value, str)) if isinstance(names, list) else ""
-        games.append(CatalogueGame(title.strip()[:180], shop, object_id, genre or "—", source or "—"))
+        image_url = item.get("libraryImageUrl")
+        games.append(CatalogueGame(title.strip()[:180], shop, object_id, genre or "—", source or "—",
+                                   image_url if isinstance(image_url, str) and len(image_url) <= 2048 else None))
     return games, total, max(1, (total + 19) // 20)
 
 
@@ -828,6 +872,32 @@ class UpdateConfirm(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class GameCoverPreview(ModalScreen[None]):
+    BINDINGS = [Binding("escape", "close", "Закрыть")]
+    DEFAULT_CSS = """
+    GameCoverPreview { align: center middle; background: $nxct-overlay; }
+    #cover-preview-dialog { width: 90%; max-width: 75; height: 85%; padding: 1 2;
+        border: round $nxct-accent; background: $nxct-panel; }
+    #cover-preview-title { height: auto; color: $nxct-accent; text-style: bold; }
+    #cover-preview-image { width: 100%; height: 1fr; }
+    """
+
+    def __init__(self, title: str, image: PILImage.Image) -> None:
+        super().__init__()
+        self.game_title = title
+        self.cover_image = image
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="cover-preview-dialog"):
+            yield Static(self.game_title, id="cover-preview-title", markup=False)
+            yield TerminalImage(self.cover_image, id="cover-preview-image")
+            yield Button("Закрыть", id="close-cover")
+
+    @on(Button.Pressed, "#close-cover")
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class CatalogueApp(App):
     TITLE = "NXCT — игровой каталог"
     SUB_TITLE = "Локальная библиотека · каталог по запросу"
@@ -839,6 +909,7 @@ class CatalogueApp(App):
         Binding("2", "tab('downloads-tab')", "Загрузки", show=False),
         Binding("3", "tab('sources-tab')", "Источники", show=False),
         Binding("4", "tab('settings-tab')", "Настройки", show=False),
+        Binding("i", "preview_cover", "Обложка"),
         Binding("escape", "focus_results", "К результатам"),
         Binding("q", "quit", "Выход"),
     ]
@@ -885,6 +956,7 @@ class CatalogueApp(App):
     #details { width: 2fr; min-width: 29; margin-left: 2; padding: 0 2; border: round $nxct-accent; background: $nxct-panel; }
     #details .eyebrow { margin-bottom: 0; }
     #game-title { height: auto; text-style: bold; color: $nxct-title; }
+    #game-cover { display: none; width: 100%; height: 12; margin: 1 0; }
     #game-meta { height: auto; color: $nxct-accent; }
     #game-description { height: auto; color: $nxct-muted; margin-bottom: 2; }
     #game-source { height: auto; color: $nxct-secondary; margin-bottom: 2; }
@@ -933,6 +1005,7 @@ class CatalogueApp(App):
         self.running_games: dict[str, tuple[subprocess.Popen, float]] = {}
         self.remote_games: list[CatalogueGame] = []
         self.remote_game: CatalogueGame | None = None
+        self.cover_request = 0
         self.remote_page = 1
         self.remote_pages = 1
         self.remote_query = ""
@@ -998,6 +1071,7 @@ class CatalogueApp(App):
                         yield Button("Варианты загрузки →", id="choose-release", variant="success", disabled=True)
                         yield Static("ВЫБРАННАЯ ИГРА", classes="eyebrow")
                         yield Static(id="game-title", markup=False)
+                        yield TerminalImage(id="game-cover")
                         yield Static(id="game-meta", markup=False)
                         yield Static(id="game-description", markup=False)
                         yield Static(id="game-source", markup=False)
@@ -1385,6 +1459,7 @@ class CatalogueApp(App):
         self.push_screen(UpdateConfirm(version), confirmed)
 
     def clear_search(self) -> None:
+        self.clear_game_cover()
         self.remote_games = []
         self.remote_game = None
         self.remote_page = self.remote_pages = 1
@@ -1529,6 +1604,7 @@ class CatalogueApp(App):
                 loading.display = False
         if selected != self.query_one("#source-filter", Select).value:
             return
+        self.clear_game_cover()
         table = self.query_one("#games", DataTable)
         table.clear()
         self.remote_games = games
@@ -1551,13 +1627,49 @@ class CatalogueApp(App):
             self.query_one("#game-meta", Static).update("")
             self.query_one("#game-source", Static).update("")
 
+    def clear_game_cover(self) -> None:
+        self.cover_request += 1
+        cover = self.query_one("#game-cover", TerminalImage)
+        cover.display = False
+        cover.image = None
+
+    async def load_game_cover(self, game: CatalogueGame, request: int) -> None:
+        cover = self.query_one("#game-cover", TerminalImage)
+        try:
+            image = await asyncio.to_thread(fetch_game_cover, game.image_url)
+        except (HTTPError, URLError, OSError, ValueError, TimeoutError):
+            return
+        if request != self.cover_request or self.remote_game is not game or not cover.is_attached:
+            return
+        cover.image = image
+        cover.display = True
+
     def show_remote_game(self, game: CatalogueGame) -> None:
+        previous = self.remote_game
         self.remote_game = game
         self.query_one("#choose-release", Button).disabled = False
         self.query_one("#game-title", Static).update(game.title)
         self.query_one("#game-meta", Static).update(f"{game.shop} · {game.genre}")
         self.query_one("#game-description", Static).update("Игра из подключённого источника. Выберите вариант перед скачиванием.")
         self.query_one("#game-source", Static).update(f"ИСТОЧНИК\n{game.source}")
+        if previous is game:
+            return
+        self.clear_game_cover()
+        if game.image_url:
+            self.run_worker(self.load_game_cover(game, self.cover_request),
+                            group="game-cover", exclusive=True)
+
+    def action_preview_cover(self) -> None:
+        if self.query_one("#tabs", TabbedContent).active != "search-tab":
+            return
+        if self.remote_game is None:
+            self.query_one("#result-status", Static).update("Сначала выберите игру.")
+            return
+        image = self.query_one("#game-cover", TerminalImage).image
+        if image is None:
+            self.query_one("#result-status", Static).update("Обложка этой игры недоступна или ещё загружается.")
+            return
+        self.push_screen(GameCoverPreview(self.remote_game.title, image))
 
     async def load_variants(self, game: CatalogueGame, source_ids: tuple[str, ...]) -> None:
         status = self.query_one("#result-status", Static)
