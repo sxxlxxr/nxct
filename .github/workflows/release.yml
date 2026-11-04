@@ -24,7 +24,10 @@ jobs:
         run: |
           python -B - <<'PY'
           import asyncio
+          import os
           from pathlib import Path
+          import ssl
+          import sys
           from unittest.mock import patch
           import app
 
@@ -43,6 +46,17 @@ jobs:
                   await pilot.pause()
 
           asyncio.run(check())
+
+          with patch.object(sys, 'frozen', True, create=True), \
+               patch.object(ssl, 'get_default_verify_paths', return_value=type('Paths', (), {'cafile': None})()), \
+               patch.dict(os.environ, {'LD_LIBRARY_PATH': '/nxct/_internal'}):
+              context = app.https_context()
+              assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
+              assert context.get_ca_certs(), 'system CA bundle not loaded'
+              os.environ.pop('LD_LIBRARY_PATH_ORIG', None)
+              assert 'LD_LIBRARY_PATH' not in app.installer_environment()
+              os.environ['LD_LIBRARY_PATH_ORIG'] = '/original'
+              assert app.installer_environment()['LD_LIBRARY_PATH'] == '/original'
           PY
       - name: Build standalone NXCT
         run: |
@@ -96,6 +110,49 @@ jobs:
                   process.wait(timeout=8)
                   os.close(master)
               assert b'NXCT' in output and b'Traceback' not in output, repr(output[-2000:])
+
+              # The published release is still the previous one at this point.
+              # Exercise the real update-check button in the packaged binary.
+              master, slave = pty.openpty()
+              fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 55, 120, 0, 0))
+              process = subprocess.Popen([str(binary)], stdin=slave, stdout=slave, stderr=slave,
+                                         env=env, start_new_session=True)
+              os.close(slave)
+              output = bytearray()
+
+              def collect(seconds):
+                  deadline = time.monotonic() + seconds
+                  while time.monotonic() < deadline:
+                      ready, _, _ = select.select([master], [], [], 0.1)
+                      if ready:
+                          try:
+                              output.extend(os.read(master, 65536))
+                          except OSError:
+                              break
+                      if process.poll() is not None:
+                          break
+
+              try:
+                  collect(1.5)
+                  os.write(master, b'4')
+                  collect(0.5)
+                  for _ in range(17):
+                      os.write(master, b'\t')
+                      collect(0.06)
+                  os.write(master, b'\r')
+                  for _ in range(60):
+                      collect(0.25)
+                      if b'\xd0\x94\xd0\xbe\xd1\x81\xd1\x82\xd1\x83\xd0\xbf\xd0\xbd\xd0\xb0' in output or \
+                              'Установлена актуальная версия'.encode() in output:
+                          break
+                  assert ('Доступна версия'.encode() in output or
+                          'Установлена актуальная версия'.encode() in output), repr(output[-2000:])
+                  assert b'CERTIFICATE_VERIFY_FAILED' not in output
+              finally:
+                  if process.poll() is None:
+                      process.terminate()
+                  process.wait(timeout=8)
+                  os.close(master)
           PY
       - name: Include verified rqbit 9.1.0 and its license
         run: |

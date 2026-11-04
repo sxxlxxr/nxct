@@ -10,6 +10,7 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 from time import monotonic, sleep
@@ -42,7 +43,7 @@ from textual.widgets import (
 SETTINGS_PATH = Path.home() / ".config" / "nxct" / "settings.json"
 LIBRARY_PATH = SETTINGS_PATH.with_name("library.json")
 HYDRA_API = "https://hydra-api-us-east-1.losbroxas.org"
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.1.3"
 RELEASES_API = "https://api.github.com/repos/sxxlxxr/nxct/releases/latest"
 LINUX_ASSET = "nxct-linux-x86_64.tar.gz"
 RQBIT_OPENER = build_opener(ProxyHandler({}))
@@ -144,7 +145,7 @@ def hydra_json(path: str, body: dict | None = None) -> object:
         headers["Content-Type"] = "application/json"
     request = Request(HYDRA_API + path, headers=headers,
                       data=json.dumps(body).encode("utf-8") if body is not None else None)
-    with urlopen(request, timeout=12) as response:
+    with urlopen(request, timeout=12, context=https_context()) as response:
         payload = response.read(2_000_001)
         if len(payload) > 2_000_000:
             raise ValueError("ответ каталога слишком большой")
@@ -167,12 +168,39 @@ def bundled_installer() -> Path | None:
     return script if script.is_file() else None
 
 
+def https_context() -> ssl.SSLContext:
+    """Используем системные CA, даже если комплектный OpenSSL ищет их не там."""
+    if getattr(sys, "frozen", False) and not os.environ.get("SSL_CERT_FILE"):
+        if ssl.get_default_verify_paths().cafile is None:
+            for candidate in (
+                "/etc/ssl/cert.pem",
+                "/etc/ssl/certs/ca-certificates.crt",
+                "/etc/pki/tls/cert.pem",
+                "/etc/pki/tls/certs/ca-bundle.crt",
+            ):
+                if Path(candidate).is_file():
+                    return ssl.create_default_context(cafile=candidate)
+    return ssl.create_default_context()
+
+
+def installer_environment() -> dict[str, str]:
+    """Не даём библиотекам PyInstaller подменить системные библиотеки curl."""
+    env = os.environ.copy()
+    if getattr(sys, "frozen", False):
+        original = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if original is None:
+            env.pop("LD_LIBRARY_PATH", None)
+        else:
+            env["LD_LIBRARY_PATH"] = original
+    return env
+
+
 def latest_release_version() -> str | None:
     """Проверяет только опубликованный стабильный Linux-релиз NXCT."""
     request = Request(RELEASES_API, headers={"Accept": "application/vnd.github+json",
                                              "User-Agent": f"NXCT/{APP_VERSION}"})
     try:
-        with urlopen(request, timeout=12) as response:
+        with urlopen(request, timeout=12, context=https_context()) as response:
             payload = response.read(2_000_001)
     except HTTPError as error:
         if error.code == 404:
@@ -1790,11 +1818,13 @@ if __name__ == "__main__":
         if installer is None:
             print("NXCT: установщик не найден; обновление отменено.", file=sys.stderr)
         else:
-            result = subprocess.run(["sh", str(installer), "--version", f"v{app.pending_update}"], check=False)
+            environment = installer_environment()
+            result = subprocess.run(["sh", str(installer), "--version", f"v{app.pending_update}"],
+                                    env=environment, check=False)
             if result.returncode == 0:
                 launcher = Path.home() / ".local" / "bin" / "nxct"
                 try:
-                    os.execv(str(launcher), [str(launcher)])
+                    os.execve(str(launcher), [str(launcher)], environment)
                 except OSError as error:
                     print(f"NXCT обновлён. Запустите {launcher} вручную: {error}", file=sys.stderr)
             else:
